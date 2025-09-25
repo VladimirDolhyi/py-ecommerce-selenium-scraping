@@ -1,12 +1,11 @@
+import logging
 from dataclasses import dataclass
 from urllib.parse import urljoin
 import csv
-import time
 from selenium import webdriver
 from selenium.common import (
     TimeoutException,
-    NoSuchElementException,
-    ElementClickInterceptedException,
+    NoSuchElementException, ElementClickInterceptedException,
 )
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
@@ -18,12 +17,16 @@ from selenium.webdriver.support import expected_conditions as ec
 from webdriver_manager.chrome import ChromeDriverManager
 from tqdm import tqdm
 
+# Base URL for the test e-commerce site
 BASE_URL = "https://webscraper.io/"
 HOME_URL = urljoin(BASE_URL, "test-sites/e-commerce/more/")
 
 
 @dataclass
 class Product:
+    """
+    Data structure representing a single product with all required fields.
+    """
     title: str
     description: str
     price: float
@@ -33,47 +36,39 @@ class Product:
 
 def parse_product_element(el: WebElement) -> Product:
     """
-    Parses a product HTML element to extract relevant data fields.
+    Extracts product details from a single product HTML container.
 
     Args:
-        el: Selenium WebElement representing a product container.
+        el: Selenium WebElement that wraps a single product's information.
 
     Returns:
-        Product object with extracted details: title, description, price, rating, number of reviews.
+        A Product instance with parsed data (title, description, price, rating, reviews).
     """
-    # Extract product title from 'title' attribute of element with class 'title'
     title = (
         el.find_element(By.CLASS_NAME, "title").get_attribute("title").strip()
     )
-
-    # Extract product description text
     description = el.find_element(By.CLASS_NAME, "description").text.strip()
-
-    # Extract price, remove currency symbol, convert to float
-    price_text = (
-        el.find_element(By.CLASS_NAME, "price").text.strip().replace("$", "")
-    )
-    price = float(price_text)
-
-    # Count number of stars by counting elements with class 'glyphicon-star' (indicates rating)
+    price = float(el.find_element(By.CLASS_NAME, "price").text.strip().replace("$", ""))
     rating = len(el.find_elements(By.CLASS_NAME, "glyphicon-star"))
 
-    # Extract number of reviews from the second paragraph inside element with class 'ratings'
-    reviews_text = (
-        el.find_element(By.CLASS_NAME, "ratings")
-        .find_elements(By.TAG_NAME, "p")[1]
-        .text
-    )
-    num_of_reviews = int(
-        reviews_text.split(" ")[0]
-    )  # Extract the number from text like "14 reviews"
+    # Attempt to extract number of reviews from second <p> tag inside the 'ratings' div
+    try:
+        reviews_elements = el.find_element(By.CLASS_NAME, "ratings").find_elements(By.TAG_NAME, "p")
+        if len(reviews_elements) > 1:
+            reviews_text = reviews_elements[1].text.strip()
+            parts = reviews_text.split(" ")
+            num_of_reviews = int(parts[0]) if parts[0].isdigit() else 0
+        else:
+            num_of_reviews = 0
+    except NoSuchElementException:
+        num_of_reviews = 0
 
     return Product(title, description, price, rating, num_of_reviews)
 
 
 def accept_cookies_if_needed(driver: WebDriver) -> None:
     """
-    Checks for cookie consent banner and clicks 'Agree' if present to proceed.
+    Detects and accepts the cookie consent popup if it appears.
 
     Args:
         driver: Selenium WebDriver instance.
@@ -86,35 +81,50 @@ def accept_cookies_if_needed(driver: WebDriver) -> None:
             )
         )
         btn.click()  # Accept cookies to avoid blocking interactions
+        WebDriverWait(driver, 5).until(
+            ec.invisibility_of_element(btn)
+        )
     except TimeoutException:
-        pass  # No cookie consent banner appeared, continue silently
+        pass  # No cookie popup appeared, continue as usual
 
 
 def scroll_and_load_all(driver: WebDriver) -> None:
     """
-    Scrolls the page to load all products by repeatedly clicking the 'More' button.
+    Handles "Load More" button pagination by clicking it repeatedly until all products are loaded.
 
     Args:
         driver: Selenium WebDriver instance.
     """
     while True:
         try:
-            # Find the 'More' button which loads additional products
-            btn = driver.find_element(By.CLASS_NAME, "btn-primary")
+            # Wait until "More" button is clickable
+            btn = WebDriverWait(driver, 5).until(
+                ec.element_to_be_clickable((By.CLASS_NAME, "ecomerce-items-scroll-more"))
+            )
+        except TimeoutException:
+            break  # No more "More" button — all products loaded
 
-            if btn.is_displayed():
-                # Scroll to the button to make sure it's visible
-                driver.execute_script(
-                    "arguments[0].scrollIntoView(true);", btn
-                )
-                time.sleep(1)  # Small delay to ensure smooth scrolling
+        prev_count = len(driver.find_elements(By.CLASS_NAME, "thumbnail"))
 
-                btn.click()  # Click the button to load more products
-                time.sleep(2)  # Wait for new products to load
-            else:
-                break  # Button not visible means no more products to load
-        except (NoSuchElementException, ElementClickInterceptedException):
-            break  # Button not found means all products are loaded
+        try:
+            btn.click()
+        except ElementClickInterceptedException:
+            # Attempt to close overlay (like cookie banner) if blocking click
+            try:
+                close_btn = driver.find_element(By.CLASS_NAME, "acceptCookies")
+                close_btn.click()
+                WebDriverWait(driver, 2).until(ec.invisibility_of_element(close_btn))
+                btn.click()
+            except (NoSuchElementException, TimeoutException, ElementClickInterceptedException):
+                break  # If still blocked, exit loop
+
+        # Wait until more products are added to the DOM
+        try:
+            WebDriverWait(driver, 10).until(
+                lambda d: len(d.find_elements(By.CLASS_NAME, "thumbnail")) > prev_count
+            )
+        except TimeoutException:
+            break  # No new products appeared — stop scrolling
 
 
 def scrape_page(
@@ -124,36 +134,43 @@ def scrape_page(
         use_more_button: bool = False
 ) -> None:
     """
-    Loads a page URL and scrapes all product data, then saves it to CSV.
+    Scrapes product data from a single category page and writes it to a CSV file.
 
     Args:
         driver: Selenium WebDriver instance.
-        url: URL of the page to scrape.
-        filename: CSV filename to save the extracted product data.
-        use_more_button: Boolean flag indicating if 'More' button should be clicked to load all products.
+        url: Full URL of the category page.
+        filename: Filename to store the CSV results.
+        use_more_button: Whether to click the "More" button to load all products.
     """
     driver.get(url)  # Navigate to the target URL
 
     accept_cookies_if_needed(driver)  # Handle cookie consent popup if present
 
-    # If specified, load all products by clicking the 'More' button repeatedly
+    # Attempt to dismiss cookie overlays if still present
+    try:
+        WebDriverWait(driver, 5).until(
+            ec.invisibility_of_element_located((By.CLASS_NAME, "acceptCookies"))
+        )
+    except TimeoutException:
+        pass
+
     if use_more_button:
         scroll_and_load_all(driver)
 
-    # Wait until all product thumbnails are present in the DOM (max 10 seconds)
+    # Ensure all product thumbnails are loaded
     WebDriverWait(driver, 10).until(
         ec.presence_of_all_elements_located((By.CLASS_NAME, "thumbnail"))
     )
 
-    # Find all product elements on the page
+    # Collect all product containers
     products = driver.find_elements(By.CLASS_NAME, "thumbnail")
     result = []
 
-    # Iterate over all product elements with a progress bar (tqdm)
-    for el in tqdm(products, desc=f"Scraping {filename}"):
+    # Parse each product with progress bar
+    for element in tqdm(products, desc=f"Scraping {filename}"):
         try:
             product = parse_product_element(
-                el
+                element
             )  # Parse product info from element
             result.append(product)  # Add parsed product to results list
         except Exception as e:
@@ -161,7 +178,7 @@ def scrape_page(
             print(f"Failed to parse product: {e}")
             continue
 
-    # Write all scraped product data to a CSV file with appropriate headers
+    # Write all extracted data to CSV
     with open(filename, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(
@@ -181,9 +198,9 @@ def scrape_page(
 
 def get_all_products() -> None:
     """
-    Main driver function that sets up Selenium WebDriver and scrapes multiple product pages.
+    Main function that initializes the Selenium WebDriver and scrapes all defined product pages.
 
-    It scrapes various categories and saves each category to a separate CSV file.
+    Each page's data is stored in a separate CSV file named after the category.
     """
     options = Options()
     options.add_argument("--headless")  # Run Chrome in headless mode (no GUI)
@@ -196,11 +213,14 @@ def get_all_products() -> None:
 
     # Setup ChromeDriver service with webdriver-manager for automatic driver management
     service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
+    driver = None
+
+    # Setup error logging
+    logging.basicConfig(level=logging.ERROR)
 
     try:
-        # Define list of pages to scrape:
-        # Each tuple contains (filename_prefix, URL, whether to click "More" button)
+        # Define which pages to scrape:
+        driver = webdriver.Chrome(service=service, options=options)
         pages = [
             ("home", HOME_URL, False),
             ("computers", urljoin(HOME_URL, "computers"), False),
@@ -210,11 +230,15 @@ def get_all_products() -> None:
             ("touch", urljoin(HOME_URL, "phones/touch"), True),
         ]
 
-        # Loop through each page and scrape products accordingly
+        # Scrape all defined pages
         for name, url, use_more in pages:
-            scrape_page(driver, url, f"{name}.csv", use_more_button=use_more)
+            try:
+                scrape_page(driver, url, f"{name}.csv", use_more_button=use_more)
+            except Exception as e:
+                logging.error(f"Error processing page {url}: {e}", exc_info=True)
     finally:
-        driver.quit()  # Ensure browser is closed regardless of success or error
+        if driver is not None:
+            driver.quit()  # Ensure browser closes on exit
 
 
 if __name__ == "__main__":
