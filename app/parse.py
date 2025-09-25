@@ -1,6 +1,7 @@
 import logging
 import time
 from dataclasses import dataclass
+from typing import Optional
 from urllib.parse import urljoin
 import csv
 from selenium import webdriver
@@ -51,9 +52,9 @@ def parse_product_element(el: WebElement) -> Product:
     )
     description = el.find_element(By.CLASS_NAME, "description").text.strip()
     price = float(el.find_element(By.CLASS_NAME, "price").text.strip().replace("$", ""))
-    rating = len(el.find_elements(By.CLASS_NAME, "glyphicon-star"))
+    rating = len(el.find_elements(By.CLASS_NAME, "glyphicon-star"))  # Count star icons
 
-    # Attempt to extract number of reviews from second <p> tag inside the 'ratings' div
+    # Extract review count from <p> tags inside the ratings section
     try:
         reviews_elements = el.find_element(By.CLASS_NAME, "ratings").find_elements(By.TAG_NAME, "p")
         if len(reviews_elements) > 1:
@@ -68,23 +69,24 @@ def parse_product_element(el: WebElement) -> Product:
     return Product(title, description, price, rating, num_of_reviews)
 
 
-def accept_cookies_if_needed(driver: WebDriver):
+def accept_cookies_if_needed(driver: WebDriver) -> None:
     """
-    Attempts to detect and accept any cookie consent popup.
+    Attempts to detect and accept cookie consent banners on the page.
 
     Args:
-        driver: Selenium WebDriver instance.
+        driver: Selenium WebDriver instance currently active.
     """
     selectors = [
         (By.CLASS_NAME, "cookie-consent__agree"),
         (By.CLASS_NAME, "acceptCookies"),
-        # Add more selectors here if needed
     ]
 
+    # Try each known selector to find and click the accept button
     for by, value in selectors:
         try:
             btn = WebDriverWait(driver, 5).until(ec.element_to_be_clickable((by, value)))
             btn.click()
+            # Wait for the popup to disappear before continuing
             WebDriverWait(driver, 5).until(ec.invisibility_of_element_located((by, value)))
             logging.info(f"Accepted cookies using selector: {value}")
             break
@@ -92,15 +94,15 @@ def accept_cookies_if_needed(driver: WebDriver):
             continue
 
 
-def find_more_button(driver: WebDriver):
+def find_more_button(driver: WebDriver) -> Optional[WebElement]:
     """
-    Tries to locate the "Load More" pagination button using multiple strategies.
+    Tries to find the "More" button that dynamically loads additional products.
 
     Args:
         driver: Selenium WebDriver instance.
 
     Returns:
-        WebElement if the button is found, otherwise None.
+        WebElement if found, otherwise None.
     """
     try:
         return WebDriverWait(driver, 3).until(
@@ -108,6 +110,7 @@ def find_more_button(driver: WebDriver):
         )
     except TimeoutException:
         try:
+            # Try alternative button by matching the button's visible text
             return WebDriverWait(driver, 3).until(
                 ec.element_to_be_clickable((By.XPATH, "//button[contains(., 'More')]"))
             )
@@ -116,14 +119,14 @@ def find_more_button(driver: WebDriver):
             return None
 
 
-def scroll_and_load_all(driver: WebDriver, max_retries=3, wait_after_click=1.0):
+def scroll_and_load_all(driver: WebDriver, max_retries: int = 3, wait_after_click: float = 1.0) -> None:
     """
-    Clicks the "Load More" button repeatedly to reveal all products on the page.
+    Keeps clicking the "More" button to load all product items on the page.
 
     Args:
-        driver: Selenium WebDriver instance.
-        max_retries: Maximum retry attempts if button becomes stale or unclickable.
-        wait_after_click: Wait time after each click to allow DOM updates (in seconds).
+        driver: Selenium WebDriver.
+        max_retries: Number of retry attempts if button is stale or fails to click.
+        wait_after_click: Wait time after each click (in seconds).
     """
     while True:
         btn = find_more_button(driver)
@@ -135,13 +138,13 @@ def scroll_and_load_all(driver: WebDriver, max_retries=3, wait_after_click=1.0):
         while retries < max_retries:
             try:
                 btn.click()
-                time.sleep(wait_after_click)
+                time.sleep(wait_after_click)  # Wait for new content to finish loading
                 break
             except (StaleElementReferenceException, TimeoutException) as e:
                 logging.warning(f"Click attempt {retries + 1} failed: {e}")
                 retries += 1
                 time.sleep(0.5)
-                btn = find_more_button(driver)
+                btn = find_more_button(driver)  # Re-find button in case it changed
         else:
             logging.warning("Max retries reached while trying to click the load more button.")
             break
@@ -154,13 +157,13 @@ def scrape_page(
         use_more_button: bool = False
 ) -> None:
     """
-    Scrapes product data from a single category page and writes it to a CSV file.
+    Navigates to the page, optionally loads all items, and writes product data to a CSV.
 
     Args:
-        driver: Selenium WebDriver instance.
-        url: Full URL of the category page.
-        filename: Filename to store the CSV results.
-        use_more_button: Whether to click the "More" button to load all products.
+        driver: Active Selenium WebDriver instance.
+        url: URL of the product category page.
+        filename: CSV file where results will be saved.
+        use_more_button: Whether the page has a "More" button to load extra products.
     """
     driver.get(url)  # Navigate to the target URL
 
@@ -182,11 +185,11 @@ def scrape_page(
         ec.presence_of_all_elements_located((By.CLASS_NAME, "thumbnail"))
     )
 
-    # Collect all product containers
+    # Find all product containers on the page
     products = driver.find_elements(By.CLASS_NAME, "thumbnail")
     result = []
 
-    # Parse each product with progress bar
+    # Parse each product card and store its info
     for element in tqdm(products, desc=f"Scraping {filename}"):
         try:
             product = parse_product_element(
@@ -199,7 +202,7 @@ def scrape_page(
 
     logging.info(f"Total products scraped for {filename}: {len(result)}")
 
-    # Write all extracted data to CSV
+    # Write product data to CSV
     with open(filename, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(
@@ -219,25 +222,22 @@ def scrape_page(
 
 def get_all_products() -> None:
     """
-    Main function that initializes the Selenium WebDriver and scrapes all defined product pages.
+    Entry point for scraping all categories.
 
-    Each page's data is stored in a separate CSV file named after the category.
+    Sets up the headless browser, navigates to each target category page,
+    and saves extracted product info to separate CSV files.
     """
     options = Options()
-    options.add_argument("--headless")  # Run Chrome in headless mode (no GUI)
-    options.add_argument(
-        "--disable-gpu"
-    )  # Disable GPU usage (mostly for Windows headless)
-    options.add_argument(
-        "--no-sandbox"
-    )  # Bypass OS security model (useful for Linux servers)
+    options.add_argument("--headless")  # Run without browser window
+    options.add_argument("--disable-gpu")  # Disable GPU (improves stability)
+    options.add_argument("--no-sandbox")  # Required for some Linux environments
 
     # Setup ChromeDriver service with webdriver-manager for automatic driver management
     service = Service(ChromeDriverManager().install())
     driver = None
 
     # Setup error logging
-    logging.basicConfig(level=logging.ERROR)
+    logging.basicConfig(level=logging.ERROR)  # Only show errors/warnings
 
     try:
         # Define which pages to scrape:
@@ -259,7 +259,7 @@ def get_all_products() -> None:
                 logging.error(f"Error processing page {url}: {e}", exc_info=True)
     finally:
         if driver is not None:
-            driver.quit()  # Ensure browser closes on exit
+            driver.quit()  # Cleanly close browser
 
 
 if __name__ == "__main__":
